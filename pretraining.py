@@ -11,6 +11,7 @@ from lightly.models.modules import DINOProjectionHead
 from lightly.models.utils import deactivate_requires_grad, update_momentum, activate_requires_grad
 from lightly.transforms.dino_transform import DINOTransform
 from lightly.utils.scheduler import cosine_schedule
+import wandb
 
 
 class DINO(pl.LightningModule):
@@ -50,6 +51,7 @@ class DINO(pl.LightningModule):
         teacher_out = [self.forward_teacher(view) for view in global_views]
         student_out = [self.forward(view) for view in views]
         loss = self.criterion(teacher_out, student_out, epoch=self.current_epoch)
+        wandb.log({"pretrain_loss": loss})
         return loss
 
     def on_after_backward(self):
@@ -74,6 +76,18 @@ class Supervised_trainer(pl.LightningModule):
         logits = self.model(x)
         loss = self.loss_fn(logits, y)
         self.log('train_loss', loss)
+        wandb.log({"train_loss": loss})
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self.model(x)
+        loss = self.loss_fn(logits, y)
+        preds = torch.argmax(logits, dim=1)
+        acc = self.accuracy(preds, y)
+        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_acc', acc, prog_bar=True)
+        wandb.log({"val_loss": loss, "val_acc": acc})
         return loss
 
     def configure_optimizers(self):
@@ -83,22 +97,12 @@ class Supervised_trainer(pl.LightningModule):
 
 def pretrain():
     print("starting pretraining")
-    model = DINO()
+    wandb.init(project='unsup pretraining')
 
-    #TODO
-    #implement upsampling alongside the dino transform (this was the likely cause of the bad pretraining)
+    model = DINO()
     transform = DINOTransform()
 
-    # we ignore object detection annotations by setting target_transform to return 0
-    # dataset = torchvision.datasets.VOCDetection(
-    #     "datasets/pascal_voc",
-    #     download=True,
-    #     transform=transform,
-    #     target_transform=lambda t: 0,
-    # )
-
-    #is this important to have?: target_transform=lambda t: 0
-
+    #is this important to have?: target_transform=lambda t: 0 (to ignore object detection)
     cifar10 = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
     crop_transform = DINOTransform(global_crop_size=196, local_crop_size=64)
     dataset = LightlyDataset.from_torch_dataset(cifar10, transform=crop_transform)
@@ -115,6 +119,8 @@ def pretrain():
 
     trainer = pl.Trainer(max_epochs=10, devices=1, accelerator=accelerator)
     trainer.fit(model=model, train_dataloaders=dataloader)
+
+    wandb.finish()
 
     # we need to reactivate requires grad to perform supervised backpropagation later
     activate_requires_grad(model.teacher_backbone)
@@ -138,15 +144,19 @@ def create_datasets():
 
 def supervised_train(model):
     print("starting sup training")
+    wandb.init(project='sup training')
+
     train_loader, val_loader = create_datasets()
     sup_trainer = Supervised_trainer(model)
 
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     # Create a PyTorch Lightning trainer
-    trainer = pl.Trainer(max_epochs=10, devices=1, accelerator=accelerator)
+    trainer = pl.Trainer(max_epochs=10, devices=1, accelerator=accelerator, val_dataloaders=val_loader)
 
     # Train the model
     trainer.fit(sup_trainer, train_loader)
+
+    wandb.finish()
 
 if __name__ == '__main__':
 
